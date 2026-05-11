@@ -1,0 +1,28 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Local environment and editor files
+.DS_Store
+.idea/
+.vscode/
+.env
+.venv/
+venv/
+
+# Project runtime cache
+.cache/
+
+# Generated datasets and outputs
+outputs/
+fenicsx_output_files/
+
+# Generated sample artifacts
+*.npz
+*.npy
+*.h5
+*.xdmf

@@ -1,0 +1,14 @@
+name: microstructures
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - fenics-dolfinx
+  - gmsh
+  - python-gmsh
+  - pytorch
+  - torchvision
+  - scikit-learn
+  - tqdm
+  - numpy
+  - matplotlib
