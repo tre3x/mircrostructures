@@ -20,13 +20,16 @@ Output tensor shape:
 
 import argparse
 import json
-import math
 import os
-import random
 import re
 
 import numpy as np
 from tqdm import tqdm
+
+try:
+	from data_generation.fiber_geometry import fibers_from_metadata, generate_fibers, rasterize_fibers
+except ModuleNotFoundError:
+	from fiber_geometry import fibers_from_metadata, generate_fibers, rasterize_fibers
 
 
 def parse_args():
@@ -75,59 +78,6 @@ def parse_args():
 	parser.add_argument("--output", type=str, default="X_microstructure.npy", help="Output tensor file (.npy)")
 	parser.add_argument("--meta_out", type=str, default="X_microstructure_meta.json", help="Output metadata JSON")
 	return parser.parse_args()
-
-
-def generate_centers(L_value, n_fibers_value, vf_value, seed_value, min_spacing_factor_value, max_attempt_factor_value):
-	random.seed(seed_value)
-	radius = math.sqrt(vf_value * L_value * L_value / (n_fibers_value * math.pi))
-	min_dist = 2.0 * radius * min_spacing_factor_value
-
-	centers = []
-	max_attempts = int(max_attempt_factor_value * max(1, n_fibers_value))
-	attempts = 0
-
-	while len(centers) < n_fibers_value:
-		attempts += 1
-		if attempts > max_attempts:
-			raise RuntimeError(
-				"Could not place all fibers for seed {} (placed {}/{}). "
-				"Try lower Vf, fewer fibers, or lower min_spacing_factor.".format(
-					seed_value, len(centers), n_fibers_value
-				)
-			)
-
-		x_coord = random.uniform(radius, L_value - radius)
-		y_coord = random.uniform(radius, L_value - radius)
-
-		good = True
-		for (xc, yc) in centers:
-			dist = math.sqrt((x_coord - xc) ** 2 + (y_coord - yc) ** 2)
-			if dist < min_dist:
-				good = False
-				break
-
-		if good:
-			centers.append((x_coord, y_coord))
-
-	return radius, centers
-
-
-def rasterize_microstructure(L_value, radius, centers, img_size, flipud=1):
-	x = np.linspace(0.0, L_value, img_size)
-	y = np.linspace(0.0, L_value, img_size)
-	x_grid, y_grid = np.meshgrid(x, y)
-
-	mask = np.zeros((img_size, img_size), dtype=np.float32)
-	r2 = radius * radius
-
-	for xc, yc in centers:
-		d2 = (x_grid - xc) ** 2 + (y_grid - yc) ** 2
-		mask[d2 <= r2] = 1.0
-
-	if int(flipud) == 1:
-		mask = np.flipud(mask)
-
-	return mask
 
 
 def extract_seeds_from_legacy_meta(meta_path):
@@ -183,14 +133,37 @@ def extract_seeds_from_fenicsx_input(input_path):
 def resolve_seed_source(args):
 	if args.seeds.strip():
 		seeds = [int(item.strip()) for item in args.seeds.split(",") if item.strip()]
-		return seeds, ["seed_{}".format(seed) for seed in seeds], "explicit_seeds"
+		return [{"seed": seed, "source": "seed_{}".format(seed), "sample_dir": None} for seed in seeds], "explicit_seeds"
 	if args.input.strip():
 		seeds, source_files = extract_seeds_from_fenicsx_input(args.input)
-		return seeds, source_files, "fenicsx_input"
+		return [
+			{"seed": seed, "source": sample_dir, "sample_dir": sample_dir}
+			for seed, sample_dir in zip(seeds, source_files)
+		], "fenicsx_input"
 	if args.meta_y.strip():
 		seeds, source_files = extract_seeds_from_legacy_meta(args.meta_y)
-		return seeds, source_files, "legacy_meta_y"
+		return [
+			{"seed": seed, "source": source_file, "sample_dir": None}
+			for seed, source_file in zip(seeds, source_files)
+		], "legacy_meta_y"
 	raise ValueError("Provide one of --seeds, --input, or --meta_y.")
+
+
+def resolve_fibers(entry, args):
+	if entry["sample_dir"] is not None:
+		metadata_path = os.path.join(entry["sample_dir"], "metadata.json")
+		if os.path.exists(metadata_path):
+			with open(metadata_path, "r") as fobj:
+				return fibers_from_metadata(json.load(fobj))
+
+	return generate_fibers(
+		L_value=args.L,
+		n_fibers_value=args.N_fibers,
+		vf_value=args.Vf,
+		seed_value=entry["seed"],
+		min_spacing_factor_value=args.min_spacing_factor,
+		max_attempt_factor_value=args.max_attempt_factor,
+	)
 
 
 def main():
@@ -199,9 +172,9 @@ def main():
 	if args.channels not in (1, 2):
 		raise ValueError("--channels must be 1 or 2")
 
-	seeds, source_files, source_type = resolve_seed_source(args)
+	entries, source_type = resolve_seed_source(args)
 
-	print("Generating X for {} microstructures".format(len(seeds)))
+	print("Generating X for {} microstructures".format(len(entries)))
 	print(
 		"Parameters: L={}, N_fibers={}, Vf={}, min_spacing_factor={}".format(
 			args.L, args.N_fibers, args.Vf, args.min_spacing_factor
@@ -211,23 +184,10 @@ def main():
 	images = []
 	failed = []
 
-	for seed_value in tqdm(seeds, desc="Building X microstructure", unit="sample"):
+	for entry in tqdm(entries, desc="Building X microstructure", unit="sample"):
 		try:
-			radius, centers = generate_centers(
-				args.L,
-				args.N_fibers,
-				args.Vf,
-				seed_value,
-				args.min_spacing_factor,
-				args.max_attempt_factor,
-			)
-			binary = rasterize_microstructure(
-				L_value=args.L,
-				radius=radius,
-				centers=centers,
-				img_size=args.img_size,
-				flipud=args.flipud,
-			)
+			fibers = resolve_fibers(entry, args)
+			binary = rasterize_fibers(args.L, fibers, args.img_size, flipud=args.flipud)
 
 			if args.channels == 1:
 				image = binary[:, :, None]
@@ -237,8 +197,8 @@ def main():
 			images.append(image.astype(np.float32))
 
 		except Exception as err:
-			failed.append({"seed": seed_value, "error": str(err)})
-			tqdm.write("  FAILED seed {}: {}".format(seed_value, err))
+			failed.append({"seed": entry["seed"], "error": str(err)})
+			tqdm.write("  FAILED seed {}: {}".format(entry["seed"], err))
 
 	if len(images) == 0:
 		raise RuntimeError("No images generated.")
@@ -257,9 +217,9 @@ def main():
 		"min_spacing_factor": float(args.min_spacing_factor),
 		"max_attempt_factor": float(args.max_attempt_factor),
 		"flipud": int(args.flipud),
-		"seeds_used": seeds,
+		"seeds_used": [entry["seed"] for entry in entries],
 		"source_type": source_type,
-		"source_files": source_files,
+		"source_files": [entry["source"] for entry in entries],
 		"failed": failed,
 	}
 

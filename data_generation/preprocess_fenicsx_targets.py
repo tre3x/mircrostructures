@@ -172,6 +172,12 @@ def _grid_coordinates(L_value, img_size):
 	return x_coords, y_coords
 
 
+def _pixel_index_from_coordinates(coords, L_value, img_size):
+	scale = float(img_size) / float(L_value)
+	indices = np.floor(np.asarray(coords, dtype=np.float64) * scale).astype(np.int64)
+	return np.clip(indices, 0, int(img_size) - 1)
+
+
 def _triangle_bbox_indices(triangle_points, L_value, img_size):
 	min_x = max(0.0, np.min(triangle_points[:, 0]))
 	max_x = min(L_value, np.max(triangle_points[:, 0]))
@@ -229,6 +235,35 @@ def rasterize_fields(points, cells, field_specs, img_size, L_value, flipud):
 	return image
 
 
+def rasterize_cell_fields_from_centroids(cell_centroids, cell_areas, field_specs, img_size, L_value, flipud):
+	if len(field_specs) == 0:
+		return np.zeros((img_size, img_size, 0), dtype=np.float32)
+
+	x_idx = _pixel_index_from_coordinates(cell_centroids[:, 0], L_value, img_size)
+	y_idx = _pixel_index_from_coordinates(cell_centroids[:, 1], L_value, img_size)
+	pixel_ids = y_idx * int(img_size) + x_idx
+	num_pixels = int(img_size) * int(img_size)
+
+	area_weights = np.asarray(cell_areas, dtype=np.float64)
+	pixel_area = np.bincount(pixel_ids, weights=area_weights, minlength=num_pixels)
+	image = np.zeros((num_pixels, len(field_specs)), dtype=np.float32)
+
+	nonzero_mask = pixel_area > 0.0
+	for channel_index, spec in enumerate(field_specs):
+		if spec["kind"] != "cell":
+			raise ValueError("rasterize_cell_fields_from_centroids only supports cellwise fields")
+		weighted_values = area_weights * np.asarray(spec["values"], dtype=np.float64)
+		pixel_weighted_sum = np.bincount(pixel_ids, weights=weighted_values, minlength=num_pixels)
+		channel = np.zeros(num_pixels, dtype=np.float32)
+		channel[nonzero_mask] = (pixel_weighted_sum[nonzero_mask] / pixel_area[nonzero_mask]).astype(np.float32)
+		image[:, channel_index] = channel
+
+	image = image.reshape((int(img_size), int(img_size), len(field_specs)))
+	if int(flipud) == 1:
+		image = np.flipud(image)
+	return image
+
+
 def load_sample(sample_dir):
 	metadata_path = os.path.join(sample_dir, "metadata.json")
 	data_path = os.path.join(sample_dir, "sample_data.npz")
@@ -273,14 +308,24 @@ def main():
 
 			if args.representation in ("field", "both"):
 				field_specs = build_field_specs(data, field_names)
-				field_image = rasterize_fields(
-					points=np.asarray(data["points"], dtype=np.float64),
-					cells=np.asarray(data["cells"], dtype=np.int32),
-					field_specs=field_specs,
-					img_size=args.img_size,
-					L_value=float(metadata["L"]),
-					flipud=args.flipud,
-				)
+				if all(spec["kind"] == "cell" for spec in field_specs):
+					field_image = rasterize_cell_fields_from_centroids(
+						cell_centroids=np.asarray(data["cell_centroids"], dtype=np.float64),
+						cell_areas=np.asarray(data["cell_areas"], dtype=np.float64),
+						field_specs=field_specs,
+						img_size=args.img_size,
+						L_value=float(metadata["L"]),
+						flipud=args.flipud,
+					)
+				else:
+					field_image = rasterize_fields(
+						points=np.asarray(data["points"], dtype=np.float64),
+						cells=np.asarray(data["cells"], dtype=np.int32),
+						field_specs=field_specs,
+						img_size=args.img_size,
+						L_value=float(metadata["L"]),
+						flipud=args.flipud,
+					)
 				field_images.append(field_image.astype(np.float32))
 
 			if args.representation in ("global", "both"):

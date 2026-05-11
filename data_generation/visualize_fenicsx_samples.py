@@ -14,6 +14,7 @@ os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import numpy as np
+from matplotlib.patches import Ellipse
 from tqdm import tqdm
 
 
@@ -147,8 +148,27 @@ def build_summary_figure(sample_dir, output_dir, dpi, deformation_scale, show_fi
 		"Phase Map",
 		"viridis",
 	)
-	for (xc, yc) in metadata.get("fiber_centers", []):
-		axes[0].plot(xc, yc, "wo", markersize=2.5, markeredgecolor="k", markeredgewidth=0.4)
+	fiber_centers = metadata.get("fiber_centers", [])
+	fiber_axes = metadata.get("fiber_axes")
+	fiber_angles = metadata.get("fiber_angles_deg")
+	if fiber_axes is not None:
+		if fiber_angles is None:
+			fiber_angles = [0.0] * len(fiber_axes)
+		for center, axis_pair, angle_deg in zip(fiber_centers, fiber_axes, fiber_angles):
+			axes[0].add_patch(
+				Ellipse(
+					xy=(float(center[0]), float(center[1])),
+					width=2.0 * float(axis_pair[0]),
+					height=2.0 * float(axis_pair[1]),
+					angle=float(angle_deg),
+					fill=False,
+					edgecolor="white",
+					linewidth=0.5,
+				)
+			)
+	else:
+		for (xc, yc) in fiber_centers:
+			axes[0].plot(xc, yc, "wo", markersize=2.5, markeredgecolor="k", markeredgewidth=0.4)
 	fig.colorbar(phase_plot, ax=axes[0], shrink=0.85)
 
 	disp_plot = plot_nodal_field(axes[1], triangulation, disp_mag, "Displacement Magnitude", "plasma")

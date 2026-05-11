@@ -22,7 +22,6 @@ downstream datasets can still be generated from the same parameter sweeps.
 import json
 import math
 import os
-import random
 import sys
 import time
 from multiprocessing import get_context
@@ -47,6 +46,23 @@ from dolfinx.fem.petsc import LinearProblem
 from dolfinx.io import XDMFFile
 from dolfinx.io import gmsh as gmshio
 
+try:
+	from data_generation.fiber_geometry import (
+		compute_fiber_axes,
+		equivalent_radius,
+		fibers_to_metadata_fields,
+		generate_fibers,
+		normalize_fiber_shape,
+	)
+except ModuleNotFoundError:
+	from fiber_geometry import (
+		compute_fiber_axes,
+		equivalent_radius,
+		fibers_to_metadata_fields,
+		generate_fibers,
+		normalize_fiber_shape,
+	)
+
 
 # -----------------------------------------------------
 # USER PARAMETERS
@@ -57,6 +73,10 @@ Vf = 0.4
 seed = 1
 min_spacing_factor = 1.05
 max_attempt_factor = 5000
+fiber_shape = "circle"
+fiber_aspect_ratio = 1.0
+fiber_angle_deg = 0.0
+random_fiber_angle = False
 
 model_name = "Model-1"
 part_name = "RVE_Part"
@@ -153,52 +173,9 @@ def _ensure_gmsh_ready():
 	return gmsh.model
 
 
-def generate_centers(
-	L_value,
-	n_fibers_value,
-	vf_value,
-	seed_value,
-	min_spacing_factor_value,
-	max_attempt_factor_value,
-):
-	random.seed(seed_value)
-	radius = math.sqrt(vf_value * L_value * L_value / (n_fibers_value * math.pi))
-	min_dist = 2.0 * radius * min_spacing_factor_value
-
-	centers_local = []
-	max_attempts = int(max_attempt_factor_value * max(1, n_fibers_value))
-	attempts = 0
-
-	while len(centers_local) < n_fibers_value:
-		attempts += 1
-		if attempts > max_attempts:
-			raise RuntimeError(
-				"Could not place all fibers for seed {} (placed {}/{}). "
-				"Try lower Vf, fewer fibers, or lower min_spacing_factor.".format(
-					seed_value, len(centers_local), n_fibers_value
-				)
-			)
-
-		x_coord = random.uniform(radius, L_value - radius)
-		y_coord = random.uniform(radius, L_value - radius)
-
-		good = True
-		for (xc, yc) in centers_local:
-			dist = math.sqrt((x_coord - xc) ** 2 + (y_coord - yc) ** 2)
-			if dist < min_dist:
-				good = False
-				break
-
-		if good:
-			centers_local.append((x_coord, y_coord))
-
-	return radius, centers_local
-
-
 def build_fenicsx_mesh(
 	model_name_value,
-	centers_value,
-	radius_value,
+	fibers_value,
 	L_value,
 	mesh_size_value,
 	mesh_deviation_factor_value,
@@ -209,11 +186,31 @@ def build_fenicsx_mesh(
 	occ = model.occ
 
 	outer = occ.addRectangle(0.0, 0.0, 0.0, L_value, L_value)
-	disks = [occ.addDisk(xc, yc, 0.0, radius_value, radius_value) for (xc, yc) in centers_value]
+	fiber_surfaces = []
+	for fiber in fibers_value:
+		fiber_tag = occ.addDisk(
+			float(fiber["x"]),
+			float(fiber["y"]),
+			0.0,
+			float(fiber["a"]),
+			float(fiber["b"]),
+		)
+		if abs(float(fiber["angle_deg"])) > 1.0e-12:
+			occ.rotate(
+				[(2, fiber_tag)],
+				float(fiber["x"]),
+				float(fiber["y"]),
+				0.0,
+				0.0,
+				0.0,
+				1.0,
+				math.radians(float(fiber["angle_deg"])),
+			)
+		fiber_surfaces.append(fiber_tag)
 
 	matrix_dimtags, _ = occ.cut(
 		[(2, outer)],
-		[(2, tag) for tag in disks],
+		[(2, tag) for tag in fiber_surfaces],
 		removeObject=True,
 		removeTool=False,
 	)
@@ -226,7 +223,7 @@ def build_fenicsx_mesh(
 	matrix_group = model.addPhysicalGroup(2, matrix_surfaces, 1)
 	model.setPhysicalName(2, matrix_group, "MATRIX")
 
-	fiber_group = model.addPhysicalGroup(2, disks, 2)
+	fiber_group = model.addPhysicalGroup(2, fiber_surfaces, 2)
 	model.setPhysicalName(2, fiber_group, "FIBERS")
 
 	min_size = max(mesh_size_value * mesh_min_size_factor_value, 1.0e-6)
@@ -236,8 +233,8 @@ def build_fenicsx_mesh(
 		model.mesh.setSize(point_entities, max_size)
 
 	fiber_curves = []
-	for disk in disks:
-		for (dim, tag) in model.getBoundary([(2, disk)], oriented=False):
+	for fiber_tag in fiber_surfaces:
+		for (dim, tag) in model.getBoundary([(2, fiber_tag)], oriented=False):
 			if dim == 1:
 				fiber_curves.append(tag)
 
@@ -251,8 +248,9 @@ def build_fenicsx_mesh(
 		model.mesh.field.setNumber(threshold, "InField", distance)
 		model.mesh.field.setNumber(threshold, "SizeMin", min_size)
 		model.mesh.field.setNumber(threshold, "SizeMax", max_size)
-		model.mesh.field.setNumber(threshold, "DistMin", radius_value)
-		model.mesh.field.setNumber(threshold, "DistMax", 3.0 * radius_value)
+		max_axis = max(max(float(fiber["a"]), float(fiber["b"])) for fiber in fibers_value)
+		model.mesh.field.setNumber(threshold, "DistMin", max_axis)
+		model.mesh.field.setNumber(threshold, "DistMax", 3.0 * max_axis)
 		model.mesh.field.setAsBackgroundMesh(threshold)
 
 	gmsh.option.setNumber("Mesh.CharacteristicLengthMin", min_size)
@@ -468,8 +466,7 @@ def _format_timings(timings):
 def write_sample_outputs(
 	output_dir_value,
 	seed_value,
-	centers_value,
-	radius_value,
+	fibers_value,
 	domain,
 	cell_tags,
 	solution,
@@ -498,6 +495,7 @@ def write_sample_outputs(
 			xdmf.write_function(solution["u"])
 
 	if write_npz:
+		geometry_fields = fibers_to_metadata_fields(fibers_value, fiber_shape)
 		np.savez(
 			os.path.join(sample_dir, "sample_data.npz"),
 			points=points,
@@ -517,8 +515,10 @@ def write_sample_outputs(
 				sigma_xx=solution["sigma_xx"].x.array.copy(),
 				sigma_yy=solution["sigma_yy"].x.array.copy(),
 				sigma_xy=solution["sigma_xy"].x.array.copy(),
-				fiber_centers=np.asarray(centers_value, dtype=np.float64),
-			fiber_radius=np.asarray([radius_value], dtype=np.float64),
+			fiber_centers=np.asarray(geometry_fields["fiber_centers"], dtype=np.float64),
+			fiber_axes=np.asarray(geometry_fields["fiber_axes"], dtype=np.float64),
+			fiber_angles_deg=np.asarray(geometry_fields["fiber_angles_deg"], dtype=np.float64),
+			fiber_radius=np.asarray([geometry_fields["fiber_radius"]], dtype=np.float64),
 		)
 	avg_epsilon_xx = _area_average(solution["epsilon_xx"].x.array, cell_areas)
 	avg_epsilon_yy = _area_average(solution["epsilon_yy"].x.array, cell_areas)
@@ -530,9 +530,7 @@ def write_sample_outputs(
 	metadata = {
 		"seed": int(seed_value),
 		"L": float(L_value),
-		"N_fibers": int(len(centers_value)),
-		"fiber_radius": float(radius_value),
-		"fiber_centers": [[float(xc), float(yc)] for (xc, yc) in centers_value],
+		"N_fibers": int(len(fibers_value)),
 		"analysis_type": analysis_type_value,
 		"thickness": float(thickness_value),
 		"applied_strain_x": float(applied_strain_x_value),
@@ -553,6 +551,7 @@ def write_sample_outputs(
 			"npz": "sample_data.npz" if write_npz else None,
 		},
 	}
+	metadata.update(fibers_to_metadata_fields(fibers_value, fiber_shape))
 
 	with open(os.path.join(sample_dir, "metadata.json"), "w") as fobj:
 		json.dump(metadata, fobj, indent=2)
@@ -568,6 +567,10 @@ def _sample_task_config(seed_i):
 		"Vf": float(Vf),
 		"min_spacing_factor": float(min_spacing_factor),
 		"max_attempt_factor": float(max_attempt_factor),
+		"fiber_shape": fiber_shape,
+		"fiber_aspect_ratio": float(fiber_aspect_ratio),
+		"fiber_angle_deg": float(fiber_angle_deg),
+		"random_fiber_angle": bool(random_fiber_angle),
 		"model_name": model_name,
 		"part_name": part_name,
 		"analysis_type": analysis_type,
@@ -593,21 +596,24 @@ def _generate_single_sample(task_config):
 	time_start = time.perf_counter()
 
 	stage_start = time.perf_counter()
-	radius, centers = generate_centers(
+	fibers = generate_fibers(
 		task_config["L"],
 		task_config["N_fibers"],
 		task_config["Vf"],
 		seed_i,
 		task_config["min_spacing_factor"],
 		task_config["max_attempt_factor"],
+		task_config["fiber_shape"],
+		task_config["fiber_aspect_ratio"],
+		task_config["fiber_angle_deg"],
+		task_config["random_fiber_angle"],
 	)
 	timings["placement"] = time.perf_counter() - stage_start
 
 	stage_start = time.perf_counter()
 	domain, cell_tags = build_fenicsx_mesh(
 		"{}_s{}".format(task_config["model_name"], seed_i),
-		centers,
-		radius,
+		fibers,
 		task_config["L"],
 		task_config["mesh_size"],
 		task_config["mesh_deviation_factor"],
@@ -643,8 +649,7 @@ def _generate_single_sample(task_config):
 			sample_dir, metadata = write_sample_outputs(
 				task_config["output_dir"],
 				seed_i,
-				centers,
-				radius,
+				fibers,
 				domain,
 				cell_tags,
 				solution,
@@ -668,8 +673,8 @@ def _generate_single_sample(task_config):
 		"sample_dir": sample_dir if sample_dir is not None else "seed_{}".format(seed_i),
 		"metadata": metadata,
 		"timings": timings,
-		"fiber_radius": float(radius),
-		"fiber_count": int(len(centers)),
+		"fiber_radius": float(equivalent_radius(fibers[0])),
+		"fiber_count": int(len(fibers)),
 	}
 
 
@@ -744,6 +749,10 @@ def main():
 	global seed
 	global min_spacing_factor
 	global max_attempt_factor
+	global fiber_shape
+	global fiber_aspect_ratio
+	global fiber_angle_deg
+	global random_fiber_angle
 	global model_name
 	global part_name
 	global thickness
@@ -777,6 +786,10 @@ def main():
 	Vf = float(cli_args.get("Vf", Vf))
 	min_spacing_factor = float(cli_args.get("min_spacing_factor", min_spacing_factor))
 	max_attempt_factor = float(cli_args.get("max_attempt_factor", max_attempt_factor))
+	fiber_shape = normalize_fiber_shape(cli_args.get("fiber_shape", fiber_shape))
+	fiber_aspect_ratio = float(cli_args.get("fiber_aspect_ratio", fiber_aspect_ratio))
+	fiber_angle_deg = float(cli_args.get("fiber_angle_deg", fiber_angle_deg))
+	random_fiber_angle = _to_bool(cli_args.get("random_fiber_angle", random_fiber_angle))
 	analysis_type = cli_args.get("analysis_type", analysis_type)
 
 	thickness = float(cli_args.get("thickness", thickness))
@@ -821,6 +834,9 @@ def main():
 	_root_print("Output directory:", input_output_dir)
 	_summarize_legacy_controls()
 	_root_print("Worker processes:", cpus)
+	_root_print("fiber_shape:", fiber_shape)
+	_root_print("fiber_aspect_ratio:", fiber_aspect_ratio)
+	_root_print("random_fiber_angle:", random_fiber_angle)
 	_root_print("write_xdmf:", write_xdmf)
 
 	if write_input and MPI.COMM_WORLD.rank == 0:
@@ -849,15 +865,23 @@ def main():
 			}
 
 	if write_input and MPI.COMM_WORLD.rank == 0:
+		shape_family = "2D circular fiber composite RVE" if fiber_shape == "circle" else "2D elliptical fiber composite RVE"
+		semi_major, semi_minor = compute_fiber_axes(L, N_fibers, Vf, fiber_shape, fiber_aspect_ratio)
 		batch_summary = {
 			"generator": "fenicsx",
-			"shape_family": "2D circular fiber composite RVE",
+			"shape_family": shape_family,
 			"parameters": {
 				"L": float(L),
 				"N_fibers": int(N_fibers),
 				"Vf": float(Vf),
 				"min_spacing_factor": float(min_spacing_factor),
 				"max_attempt_factor": float(max_attempt_factor),
+				"fiber_shape": fiber_shape,
+				"fiber_aspect_ratio": float(fiber_aspect_ratio),
+				"fiber_angle_deg": float(fiber_angle_deg),
+				"random_fiber_angle": bool(random_fiber_angle),
+				"fiber_semi_major": float(semi_major),
+				"fiber_semi_minor": float(semi_minor),
 				"analysis_type": analysis_type,
 				"thickness": float(thickness),
 				"matrix_E": float(matrix_E),

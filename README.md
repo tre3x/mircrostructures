@@ -110,6 +110,38 @@ conda run -n microstructures python data_generation/generate_fenicsx_rve_dataset
   output_dir=outputs/fenicsx_batch
 ```
 
+Generate elliptical fibers instead of circles:
+
+```bash
+conda run -n microstructures python data_generation/generate_fenicsx_rve_dataset.py \
+  num=20 \
+  start_seed=1 \
+  cpus=4 \
+  L=150 \
+  N_fibers=20 \
+  Vf=0.4 \
+  fiber_shape=ellipse \
+  fiber_aspect_ratio=2.0 \
+  random_fiber_angle=true \
+  matrix_E=3.2e9 \
+  matrix_nu=0.35 \
+  fiber_E=87.0e9 \
+  fiber_nu=0.20 \
+  applied_strain_x=0.001 \
+  mesh_size=2.0 \
+  write_xdmf=false \
+  output_dir=outputs/fenicsx_ellipse_batch
+```
+
+Ellipse-specific knobs:
+
+- `fiber_shape=circle|ellipse`
+- `fiber_aspect_ratio` sets the semi-major / semi-minor ratio for ellipses and must be `>= 1.0`
+- `fiber_angle_deg` sets a fixed in-plane angle in degrees when `random_fiber_angle=false`
+- `random_fiber_angle=true` samples a separate angle in `[0, 180)` for each fiber
+
+The total fiber area fraction `Vf` is preserved for both circles and ellipses.
+
 Per sample, the script writes:
 
 - `job_s<seed>/sample_data.npz`
@@ -127,6 +159,7 @@ Important runtime notes:
 - `write_xdmf=false` is the recommended production setting for training-data generation.
 - the generator prints progress bars and per-sample timings
 - `batch_summary.json` includes a `timing_summary` section and total wall time
+- the preprocessing scripts read geometry from FEniCSx `metadata.json`, so ellipse batches can be rasterized without extra flags
 
 
 ## 2. Visualize Generated Samples
@@ -168,6 +201,8 @@ conda run -n microstructures python data_generation/preprocess_microstructure_in
   --meta_out outputs/X_microstructure_meta.json
 ```
 
+When `--input` points to FEniCSx sample folders, this script reads fiber geometry from each sample's `metadata.json`. That includes ellipse axes and orientations when present.
+
 Output tensor shape:
 
 - `(H, W, C, N)`
@@ -193,6 +228,8 @@ conda run -n microstructures python data_generation/preprocess_material_field_in
   --output outputs/X_material.npy \
   --meta_out outputs/X_material_meta.json
 ```
+
+As with the binary preprocessor, FEniCSx inputs use the stored sample geometry, so circular and elliptical batches both work.
 
 Typical channels:
 
@@ -333,6 +370,45 @@ conda run -n microstructures python training/train_forward_surrogate.py \
   --batch_size 8
 ```
 
+### Elliptical microstructure input + multitask target
+
+```bash
+conda run -n microstructures python data_generation/generate_fenicsx_rve_dataset.py \
+  num=100 start_seed=1 cpus=4 L=150 N_fibers=20 Vf=0.4 \
+  fiber_shape=ellipse fiber_aspect_ratio=2.0 random_fiber_angle=true \
+  mesh_size=2.0 write_xdmf=false output_dir=outputs/fenicsx_ellipse_batch
+
+conda run -n microstructures python data_generation/preprocess_microstructure_inputs.py \
+  --input outputs/fenicsx_ellipse_batch \
+  --img_size 128 \
+  --channels 1 \
+  --L 150 --N_fibers 20 --Vf 0.4 \
+  --output outputs/X_ellipse.npy \
+  --meta_out outputs/X_ellipse_meta.json
+
+conda run -n microstructures python data_generation/preprocess_fenicsx_targets.py \
+  --input outputs/fenicsx_ellipse_batch \
+  --representation both \
+  --field_set stress_strain \
+  --img_size 128 \
+  --field_output outputs/Y_ellipse_fields.npy \
+  --global_output outputs/Y_ellipse_global.npy \
+  --meta_out outputs/Y_ellipse_meta.json
+
+conda run -n microstructures python training/train_forward_surrogate.py \
+  --x outputs/X_ellipse.npy \
+  --x_meta outputs/X_ellipse_meta.json \
+  --y_fields outputs/Y_ellipse_fields.npy \
+  --y_global outputs/Y_ellipse_global.npy \
+  --y_meta outputs/Y_ellipse_meta.json \
+  --task both \
+  --out_dir outputs/training_runs/forward_surrogate_ellipse \
+  --epochs 50 \
+  --batch_size 8
+```
+
+The preprocessing and target-generation steps are unchanged for ellipse batches because they read the stored fiber geometry from the generated FEniCSx sample metadata.
+
 
 ## Data Contracts
 
@@ -348,10 +424,12 @@ Each `job_s<seed>/sample_data.npz` contains arrays such as:
 - `sigma_xx`, `sigma_yy`, `sigma_xy`
 - `E`, `nu`
 - `fiber_centers`, `fiber_radius`
+- `fiber_axes`, `fiber_angles_deg`
 
 Each `metadata.json` contains:
 
 - generation parameters
+- fiber geometry metadata (`fiber_shape`, `fiber_centers`, `fiber_axes`, `fiber_angles_deg`)
 - averaged stress/strain summaries
 - mesh sizes
 - seed and provenance
