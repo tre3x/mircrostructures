@@ -281,6 +281,13 @@ The training script supports three tasks:
 - `global`: predict global-response outputs only
 - `both`: multitask prediction
 
+By default, training uses a deterministic train/validation split:
+
+- `--val_fraction 0.2`
+- `--seed 42`
+
+There is no separate test split created automatically. The evaluation script reuses the saved train/validation indices from the training checkpoint unless you prepare a separate held-out dataset yourself.
+
 Example multitask run:
 
 ```bash
@@ -298,6 +305,37 @@ conda run -n microstructures python training/train_forward_surrogate.py \
   --val_fraction 0.2 \
   --base_channels 32
 ```
+
+Optional Weights & Biases logging:
+
+```bash
+conda run -n microstructures python training/train_forward_surrogate.py \
+  --x outputs/X_microstructure.npy \
+  --x_meta outputs/X_microstructure_meta.json \
+  --y_fields outputs/Y_fields.npy \
+  --y_global outputs/Y_global.npy \
+  --y_meta outputs/Y_meta.json \
+  --task both \
+  --out_dir outputs/training_runs/forward_surrogate \
+  --epochs 50 \
+  --batch_size 8 \
+  --val_fraction 0.2 \
+  --seed 42 \
+  --wandb \
+  --wandb_project microstructures \
+  --wandb_run_name stress-field-surrogate \
+  --wandb_field_channels sigma_xx,sigma_yy,sigma_xy \
+  --wandb_num_examples 2 \
+  --wandb_visualize_every 1
+```
+
+When `--wandb` is enabled, the training script logs:
+
+- train/validation losses per epoch
+- fixed validation examples across epochs
+- target vs prediction vs absolute error figures for the selected field channels
+
+For `stress_strain` targets, the default W&B visualization channels are the stress components (`sigma_xx`, `sigma_yy`, `sigma_xy`) when those names are available in `Y_meta.json`.
 
 Saved artifacts:
 
@@ -367,7 +405,9 @@ conda run -n microstructures python training/train_forward_surrogate.py \
   --task both \
   --out_dir outputs/training_runs/forward_surrogate \
   --epochs 50 \
-  --batch_size 8
+  --batch_size 8 \
+  --val_fraction 0.2 \
+  --seed 42
 ```
 
 ### Elliptical microstructure input + multitask target
@@ -404,7 +444,9 @@ conda run -n microstructures python training/train_forward_surrogate.py \
   --task both \
   --out_dir outputs/training_runs/forward_surrogate_ellipse \
   --epochs 50 \
-  --batch_size 8
+  --batch_size 8 \
+  --val_fraction 0.2 \
+  --seed 42
 ```
 
 The preprocessing and target-generation steps are unchanged for ellipse batches because they read the stored fiber geometry from the generated FEniCSx sample metadata.
